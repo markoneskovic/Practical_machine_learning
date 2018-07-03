@@ -1,0 +1,172 @@
+---
+title: "Practical Machine Learning: Prediction Assignment Writeup"
+author: "Marko Neskovic"
+date: '03 jul 2018 '
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+In this project, goal will be to use data about personal activity, from accelerometers on the belt, forearm, arm, and dumbell of 6 participants. One thing that people regularly do is quantify how much of a particular activity they do, but they rarely quantify how well they do it. Therefore, they were asked to perform barbell lifts correctly and incorrectly in 5 different ways. More information is available from the website [link](http://groupware.les.inf.puc-rio.br/har), and data can be found on the following links: training - [link](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv) and test - [link](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv).
+
+The goal of the project is to predict the manner in which they did the exercise. This is the "classe" variable in the training set. This report is describing how model was built, how cross validation was used and why we made the choices. Also, model predictions will be used on 20 different test cases.
+
+# Data load, exploration and cleaning
+
+## Load packages and data
+```{r message = FALSE, warning = FALSE}
+library(readr)
+library(dplyr)
+library(purrr)
+
+library(caret)
+library(ranger)
+library(xgboost)
+library(kernlab)
+
+library(doParallel)
+
+training <- read_csv('pml-training.csv', na = c("NA", "#DIV/0!", ""))
+testing <- read_csv('pml-testing.csv', na = c("NA", "#DIV/0!", ""))
+```
+## Explore and clean data
+
+With following code we will explore structure of data
+```{r results='hide'}
+glimpse(training)
+glimpse(testing)
+```
+
+It seems that first variable X1 in both training and testing is ID column. We will test this and remove this column if that is the case. However, for now we will remove only columns from traninig, althogh we explore testing too.
+```{r}
+n_distinct(training$X1)
+n_distinct(testing$X1); n_distinct(testing$problem_id)
+training$X1 <- NULL
+```
+
+Next step is to explore is there NA values in datasets and to handle them. We will save this dataset as new, so we always have original data in memory if necessary (it is small dataset).
+```{r}
+# check for NAs
+sum(is.na(training)); sum(is.na(testing))
+sum(complete.cases(training)); sum(complete.cases(testing))
+
+# NAs per columns
+table(map_int(training, function (x) {sum(is.na(x))})) # only part of variables to use
+table(map_int(testing, function (x) {sum(is.na(x))}))  # same
+
+# remove NA columns
+training2 <- training[,colSums(is.na(training)) <= 1]
+sum(complete.cases(training2))
+```
+
+Since there is column with users name, we will check if there is relationship with user and classe. We can see that for each user there is fairly good distribution of classes. Therefore we will code this variable as numeric, and use it in model because maybe there are some connection between way of working of each user with results.
+```{r}
+table(training2$user_name, training2$classe) # user vs classe
+training2$user_name <- as.numeric(as.factor(training2$user_name)) # 1 adelmo 2 carlitos 3 charles 4 eurico 5 jeremy 6 pedro
+```
+
+We will copy target variable and remove it from the dataset, for the porpuse of futher preprocesing.
+```{r}
+table(training2$classe)
+y <- training2$classe
+training2$classe <- NULL
+```
+
+Further, we will examine data more and remove some variables from analysis. First we will test for variables which have small or none variance, and then check for number of highly correlated variables. Variables with small or none variance together with variables which represents time we wil exclude from analysis. However, highly correlated variables, althoug checked will not be removed, since we are going to use machine learning algorithms that are very good at managing high correlations.
+```{r results='hide'}
+# check for NZV and remove them with timestamps
+nearZeroVar(training2, saveMetrics = T)
+training2 <- select(training2, -nearZeroVar(training2), -contains('timestamp'))
+
+# check for higly correlated variables
+findCorrelation(cor(training2, use = 'complete.obs'), cutoff = .75)
+```
+
+In the following part we will preproces data for analysis, set controls for training, paramters grid for algorithms, split data to train and validation sets. We will impute missing values with their median value, and then we will split dataset to training and test. For control of training we will use repeated 5-fold cross validation, 3 times. We will set hyperparameters grid but we will not use many values, and we will use random grid of hyperparamters during training. For this analysis we will use three algorithms: random forest, extreme gradient boosting and radial SVM.
+```{r results='hide', message=FALSE, warning=FALSE}
+# impute missing values with median values
+preprocess <- preProcess(training2, method = 'medianImpute')
+training2 <- predict(preprocess, training2)
+any(is.na(training2)) # test if it is done
+
+# attach back target variable
+training2$classe <- as.factor(y)
+
+# train / test split
+idx <- createDataPartition(training2$classe, times = 1, p = .75, list = FALSE )
+train <- training2[idx, ]
+test <- training2[-idx, ]
+
+# set training procedure
+tr_cntrl <- trainControl(method = "repeatedcv", number = 5, repeats = 1, classProbs = TRUE, search = 'random')
+
+# set parameters grids
+params_rf <- expand.grid(.mtry = floor(c(sqrt(ncol(train)):(ncol(train)/3))),
+                         .splitrule = 'gini',
+                         .min.node.size = 1)
+
+params_xgb <- expand.grid(eta = c(0.025, 0.05, 0.1),
+                          colsample_bytree = c(0.5, 0.7),
+                          max_depth = c(3, 6),
+                          nrounds = 100,
+                          gamma = 1,
+                          min_child_weight = 1,
+                          subsample = c(0.75, 0.85))
+
+params_svm <- expand.grid(sigma = c(0.01, 0.1),
+                          C = c(0.75, 1, 1.25))
+
+# set parallel
+cl <- makePSOCKcluster(3)
+registerDoParallel(cl)
+
+# run models
+md_rf <- train(classe ~ ., data = train, method = 'ranger', trControl = tr_cntrl, tuneGrid = params_rf)
+
+md_xgb <- train(classe ~ ., data = train, method = 'xgbTree', trControl = tr_cntrl, tuneGrid = params_xgb)
+
+md_svm <- train(classe ~ ., data = train, method = 'svmRadial', trControl = tr_cntrl, tuneGrid = params_svm)
+```
+
+In the following part we will exemine reuslts of models and use them on test set to check external validity.
+```{r}
+# check results
+md_rf
+md_xgb
+md_svm
+
+# predict and choose the best
+preds_rf <- predict(md_rf, test, Type = 'class')
+confusionMatrix(preds_rf, test$classe)
+
+preds_xgb <- predict(md_xgb, test, Type = 'class')
+confusionMatrix(preds_xgb, test$classe)
+
+preds_svm <- predict(md_svm, test, Type = 'class')
+confusionMatrix(preds_svm, test$classe)
+```
+
+Based on the results we will choose xgb model to predict on pml_testing, set for submission. Before that, we will select columns from testing which exists in train and test, and at the end we will save results in the files for submission and stop clusters.
+```{r}
+# select columns and predict
+pml_testing <- select(testing, names(test)[-ncol(test)])
+pml_testing$user_name <- as.numeric(as.factor(pml_testing$user_name)) 
+
+pml_testing_preds <- predict(md_xgb, pml_testing, Type = 'class')
+
+# write files for submission
+for(i in 1:length(pml_testing_preds)){
+  write.table(pml_testing_preds[i],
+              file = paste0("problem_id_",i,".txt"),
+              quote = FALSE, row.names = FALSE, col.names = FALSE)
+}
+
+# stop clusters
+stopCluster(cl)
+```
+
+With this, we will conclude our analysis.
